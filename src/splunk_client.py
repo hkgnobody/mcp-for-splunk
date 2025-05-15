@@ -12,7 +12,7 @@ def get_splunk_service() -> client.Service:
     username = os.getenv("SPLUNK_USERNAME")
     password = os.getenv("SPLUNK_PASSWORD")
     token = os.getenv("SPLUNK_TOKEN")
-    
+
     try:
         if token:
             service = client.Service(
@@ -36,7 +36,9 @@ def get_splunk_service() -> client.Service:
         service.login()
         
         # Test the connection by trying to get server info
-        _ = service.info
+        _ = service.login()
+        info = service.info
+        print(f"Successfully connected to Splunk {info['version']} at {host}:{port}")
         
         return service
         

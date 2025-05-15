@@ -2,7 +2,8 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
-
+from urllib.parse import quote
+import asyncio
 from mcp.server.fastmcp import FastMCP, Context
 from splunklib import client
 from splunklib.results import ResultsReader
@@ -14,13 +15,17 @@ import logging
 import time
 
 # Create logs directory if it doesn't exist
-log_dir = os.path.dirname(os.path.dirname(__file__)) + '/logs'
+log_dir = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(log_dir, exist_ok=True)
 
+# Enhanced logging configuration
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename=log_dir + '/mcp_splunk_server.log'
+    handlers=[
+        logging.FileHandler(log_dir + '/mcp_splunk_server.log'),
+        logging.StreamHandler()  # Also log to console
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -88,6 +93,36 @@ def list_indexes(ctx: Context) -> Dict[str, Any]:
     }
 
 @mcp.tool()
+def list_sourcetypes(ctx: Context) -> Dict[str, Any]:
+    """
+    List all available sourcetypes from the configured Splunk instance.
+    
+    Returns:
+        Dict containing list of sourcetypes and count
+    """
+    service = ctx.request_context.lifespan_context.service
+    sourcetypes = [sourcetype.name for sourcetype in service.sourcetypes]
+    return {
+        "sourcetypes": sorted(sourcetypes),
+        "count": len(sourcetypes)
+    }
+
+@mcp.tool()
+def list_sources(ctx: Context) -> Dict[str, Any]:
+    """
+    List all sources from the configured Splunk instance.
+
+    Returns:
+        Dict containing list of sources and count
+    """
+    service = ctx.request_context.lifespan_context.service
+    sources = [source.name for source in service.sources]
+    return {
+        "sources": sorted(sources),
+        "count": len(sources)
+    }
+
+@mcp.tool()
 def run_oneshot_search(
     ctx: Context,
     query: str,
@@ -98,23 +133,27 @@ def run_oneshot_search(
     """
     Execute a one-shot Splunk search that returns results immediately. Use this tool for quick,
     simple searches where you need immediate results and don't need to track job progress.
+    Best for simple searches that return quickly.
     
     Args:
-        query: The Splunk search query (SPL) to execute
+        query: The Splunk search query (SPL) to execute. The 'search' command will be automatically
+            added if not present (e.g., "index=main" becomes "search index=main")
         earliest_time: Search start time (default: "-15m")
         latest_time: Search end time (default: "now")
         max_results: Maximum number of results to return (default: 100)
     
     Returns:
         Dict containing:
-            - search_results: List of search results
+            - results: List of search results as dictionaries
             - results_count: Number of results returned
-            - query_executed: The query that was executed
+            - query_executed: The actual query that was executed
     
     Example:
-        # These are equivalent:
-        run_oneshot_search(query="index=main | head 10")
-        run_oneshot_search(query="search index=main | head 10")
+        run_oneshot_search(
+            query="index=_internal | stats count by log_level",
+            earliest_time="-1h",
+            max_results=10
+        )
     """
     service = ctx.request_context.lifespan_context.service
     
@@ -131,19 +170,27 @@ def run_oneshot_search(
             "count": max_results
         }
         
-        results = []
+        start_time = time.time()
         job = service.jobs.oneshot(query, **kwargs)
+        
+        # Process results
+        results = []
+        result_count = 0
         
         for result in ResultsReader(job):
             if isinstance(result, dict):
                 results.append(result)
-            if len(results) >= max_results:
-                break
+                result_count += 1
+                if result_count >= max_results:
+                    break
+        
+        duration = time.time() - start_time
         
         return {
-            "search_results": results,
-            "results_count": len(results),
-            "query_executed": query
+            "results": results,
+            "results_count": result_count,
+            "query_executed": query,
+            "duration": round(duration, 3)
         }
     except Exception as e:
         logger.error(f"One-shot search failed: {str(e)}")
@@ -159,9 +206,11 @@ def run_splunk_search(
     """
     Execute a normal Splunk search job with progress tracking. Use this tool for complex or
     long-running searches where you need to track progress and get detailed job information.
+    Best for complex searches that might take longer to complete.
     
     Args:
-        query: The Splunk search query (SPL) to execute
+        query: The Splunk search query (SPL) to execute. The 'search' command will be automatically
+            added if not present (e.g., "index=main" becomes "search index=main")
         earliest_time: Search start time (default: "-24h")
         latest_time: Search end time (default: "now")
     
@@ -171,13 +220,17 @@ def run_splunk_search(
             - is_done: Whether the search is complete
             - scan_count: Number of events scanned
             - event_count: Number of events matched
-            - results: Search results
+            - results: List of search results as dictionaries
+            - results_count: Number of results returned
             - query_executed: The actual query that was executed
+            - duration: Search duration in seconds
+            - status: Search status information
     
     Example:
-        # These are equivalent:
-        run_splunk_search(query="index=* | stats count by source")
-        run_splunk_search(query="search index=* | stats count by source")
+        run_splunk_search(
+            query="index=* | stats count by source",
+            earliest_time="-7d"
+        )
     """
     # Add 'search' command if not present and query doesn't start with a pipe
     if not query.strip().lower().startswith(('search ', '| ')):
@@ -187,6 +240,8 @@ def run_splunk_search(
     service = ctx.request_context.lifespan_context.service
     
     try:
+        start_time = time.time()
+        
         # Create the search job
         job = service.jobs.create(
             query,
@@ -211,13 +266,17 @@ def run_splunk_search(
             )
             time.sleep(2)
         
-        # Get the final results
+        # Get the results using ResultsReader for consistent parsing
         results = []
-        for result in job.results():
-            results.append(result)
+        result_count = 0
+        for result in ResultsReader(job.results()):
+            if isinstance(result, dict):
+                results.append(result)
+                result_count += 1
         
         # Get final job stats
         stats = job.content
+        duration = time.time() - start_time
         
         return {
             "job_id": job.sid,
@@ -225,8 +284,9 @@ def run_splunk_search(
             "scan_count": int(float(stats.get('scanCount', 0))),
             "event_count": int(float(stats.get('eventCount', 0))),
             "results": results,
+            "results_count": result_count,
             "query_executed": query,
-            "duration": float(stats.get('runDuration', 0)),
+            "duration": round(duration, 3),
             "status": {
                 "progress": 100,
                 "is_finalized": stats.get('isFinalized', '0') == '1',
@@ -300,7 +360,7 @@ def list_users(ctx: Context) -> Dict[str, Any]:
         raise
 
 @mcp.tool()
-def list_kvstore_collections_by_app(
+def list_kvstore_collections(
     ctx: Context,
     app: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -418,12 +478,17 @@ def create_kvstore_collection(
     to create a new collection for storing custom data in Splunk.
     
     Args:
-        app: Name of the app where the collection should be created (e.g., 'search', 'myapp')
-        collection: Name for the new collection (must be unique within the app)
+        app: Name of the app where the collection should be created (e.g., 'search', 'myapp').
+             The app must exist and you must have permissions to create collections.
+        collection: Name for the new collection. Must be unique within the app and contain only
+                   alphanumeric characters and underscores.
         fields: Optional list of field definitions to structure the collection data. Each field
-            definition should be a dict with 'name', 'type', and optional 'required' keys
+            definition should be a dict with:
+            - name: Field name
+            - type: Field type (string, number, boolean)
+            - required: Whether the field is required (optional)
         accelerated_fields: Optional dict defining indexed fields for better query performance
-        replicated: Whether the collection should be replicated across search heads
+        replicated: Whether the collection should be replicated across search heads (default: True)
     
     Returns:
         Dict containing:
@@ -431,12 +496,15 @@ def create_kvstore_collection(
             - collection: Details of the created collection
     
     Example:
-        Create a simple collection:
-        create_kvstore_collection(app="myapp", collection="users")
-        
-        Create a structured collection:
+        # Create a simple collection
         create_kvstore_collection(
-            app="myapp",
+            app="search",
+            collection="mycollection"
+        )
+        
+        # Create a structured collection
+        create_kvstore_collection(
+            app="search",
             collection="users",
             fields=[
                 {"name": "username", "type": "string", "required": True},
@@ -449,6 +517,18 @@ def create_kvstore_collection(
     service = ctx.request_context.lifespan_context.service
     
     try:
+        # Validate app name
+        if not app:
+            raise ValueError("App name is required")
+            
+        # Validate collection name
+        if not collection.isalnum() and not '_' in collection:
+            raise ValueError("Collection name must contain only alphanumeric characters and underscores")
+        
+        # URL encode the app name to handle special characters
+        encoded_app = quote(app, safe='')
+        
+        # Prepare collection configuration
         collection_config = {
             "name": collection,
             "replicated": replicated
@@ -460,7 +540,9 @@ def create_kvstore_collection(
         if accelerated_fields:
             collection_config["accelerated_fields"] = accelerated_fields
             
-        new_collection = service.kvstore[app].create(
+        # Create the collection
+        kvstore = service.kvstore[encoded_app]
+        new_collection = kvstore.create(
             name=collection,
             **collection_config
         )
@@ -474,9 +556,10 @@ def create_kvstore_collection(
                 "replicated": new_collection.content.get("replicated", False)
             }
         }
+
     except Exception as e:
         logger.error(f"Failed to create KV Store collection: {str(e)}")
-        raise
+        raise ValueError(f"Failed to create collection: {str(e)}")
 
 @mcp.tool()
 def get_configurations(
@@ -518,3 +601,13 @@ def get_configurations(
     except Exception as e:
         logger.error(f"Failed to get configurations: {str(e)}")
         raise
+
+if __name__ == "__main__":
+    logger.info("Starting MCP Server for Splunk...")
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal server error: {str(e)}", exc_info=True)
+        sys.exit(1)
