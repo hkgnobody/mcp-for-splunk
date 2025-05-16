@@ -603,9 +603,10 @@ def get_configurations(
         raise
 
 if __name__ == "__main__":
+    import asyncio
     logger.info("Starting MCP Server for Splunk...")
     try:
-        mcp.run()
+        asyncio.run(mcp.run())
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
     except Exception as e:
