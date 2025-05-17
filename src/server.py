@@ -95,32 +95,62 @@ def list_indexes(ctx: Context) -> Dict[str, Any]:
 @mcp.tool()
 def list_sourcetypes(ctx: Context) -> Dict[str, Any]:
     """
-    List all available sourcetypes from the configured Splunk instance.
+    List all available sourcetypes from the configured Splunk instance using metadata command.
+    This tool returns a comprehensive list of sourcetypes present in your Splunk environment.
     
     Returns:
         Dict containing list of sourcetypes and count
     """
     service = ctx.request_context.lifespan_context.service
-    sourcetypes = [sourcetype.name for sourcetype in service.sourcetypes]
-    return {
-        "sourcetypes": sorted(sourcetypes),
-        "count": len(sourcetypes)
-    }
+    logger.info("Retrieving list of sourcetypes...")
+    
+    try:
+        # Use metadata command to retrieve sourcetypes
+        job = service.jobs.oneshot("| metadata type=sourcetypes | table sourcetype")
+        
+        sourcetypes = []
+        for result in ResultsReader(job):
+            if isinstance(result, dict) and "sourcetype" in result:
+                sourcetypes.append(result["sourcetype"])
+        
+        logger.info(f"Retrieved {len(sourcetypes)} sourcetypes")
+        return {
+            "sourcetypes": sorted(sourcetypes),
+            "count": len(sourcetypes)
+        }
+    except Exception as e:
+        logger.error(f"Failed to retrieve sourcetypes: {str(e)}")
+        raise
 
 @mcp.tool()
 def list_sources(ctx: Context) -> Dict[str, Any]:
     """
-    List all sources from the configured Splunk instance.
+    List all available data sources from the configured Splunk instance using metadata command.
+    This tool provides a comprehensive inventory of data sources in your Splunk environment.
 
     Returns:
         Dict containing list of sources and count
     """
     service = ctx.request_context.lifespan_context.service
-    sources = [source.name for source in service.sources]
-    return {
-        "sources": sorted(sources),
-        "count": len(sources)
-    }
+    logger.info("Retrieving list of sources...")
+    
+    try:
+        # Use metadata command to retrieve sources
+        job = service.jobs.oneshot("| metadata type=sources | table source")
+        
+        sources = []
+        for result in ResultsReader(job):
+            if isinstance(result, dict) and "source" in result:
+                sources.append(result["source"])
+        
+        logger.info(f"Retrieved {len(sources)} sources")
+        return {
+            "sources": sorted(sources),
+            "count": len(sources)
+        }
+    except Exception as e:
+        logger.error(f"Failed to retrieve sources: {str(e)}")
+        raise
 
 @mcp.tool()
 def run_oneshot_search(
