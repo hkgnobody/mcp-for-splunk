@@ -1,5 +1,4 @@
-fastapi>=0.100.0
-uvicorn[standard]>=0.20.0
+mcp[cli]>=1.8.1
+fastmcp>=2.3.4
 splunk-sdk>=1.7.0
 python-dotenv>=1.0.0
-modelcontext>=0.1.0 # Ensure you have the correct/latest version

@@ -52,8 +52,29 @@ mcp = FastMCP(
     "MCP Server for Splunk",
     description="MCP server for Splunk interaction",
     version="0.1.0",
-    lifespan=splunk_lifespan
+    lifespan=splunk_lifespan,
+    prompt="""
+    You are a Splunk expert. You are able to answer questions about Splunk and Splunk apps.
+    You are able to use the following tools to get information about Splunk:
+    - get_splunk_health
+    - list_indexes
+    - list_sourcetypes
+    - list_sources
+    - run_oneshot_search
+    - run_splunk_search
+    - list_apps
+    - list_users
+    - list_kvstore_collections
+    - get_kvstore_data
+    - create_kvstore_collection
+    - list_kvstore_collections
+    - get_kvstore_data
+    - create_kvstore_collection
+    - list_kvstore_collections
+    """
 )
+
+# Health check will be handled by FastMCP's built-in health endpoint
 
 @mcp.tool()
 def get_splunk_health(ctx: Context) -> Dict[str, Any]:
@@ -156,9 +177,9 @@ def list_sources(ctx: Context) -> Dict[str, Any]:
 def run_oneshot_search(
     ctx: Context,
     query: str,
-    earliest_time: Optional[str] = "-15m",
-    latest_time: Optional[str] = "now",
-    max_results: Optional[int] = 100
+    earliest_time: str = "-15m",
+    latest_time: str = "now",
+    max_results: int = 100
 ) -> Dict[str, Any]:
     """
     Execute a one-shot Splunk search that returns results immediately. Use this tool for quick,
@@ -230,8 +251,8 @@ def run_oneshot_search(
 def run_splunk_search(
     ctx: Context,
     query: str,
-    earliest_time: Optional[str] = "-24h",
-    latest_time: Optional[str] = "now"
+    earliest_time: str = "-24h",
+    latest_time: str = "now"
 ) -> Dict[str, Any]:
     """
     Execute a normal Splunk search job with progress tracking. Use this tool for complex or
@@ -314,6 +335,8 @@ def run_splunk_search(
             "scan_count": int(float(stats.get('scanCount', 0))),
             "event_count": int(float(stats.get('eventCount', 0))),
             "results": results,
+            "earliest_time": stats.get('earliestTime', ''),
+            "latest_time": stats.get('latestTime', ''),
             "results_count": result_count,
             "query_executed": query,
             "duration": round(duration, 3),
@@ -636,7 +659,15 @@ if __name__ == "__main__":
     import asyncio
     logger.info("Starting MCP Server for Splunk...")
     try:
+        # Using SSE transport for better compatibility with proxies and load balancers
         asyncio.run(mcp.run())
+        # asyncio.run(mcp.run_async(
+        #     transport="sse",
+        #     host="0.0.0.0",
+        #     port=8000,
+        #     path="/mcp/sse",
+        #     message_path="/mcp/messages"
+        # ))
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
     except Exception as e:

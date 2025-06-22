@@ -1,0 +1,115 @@
+version: "3.8"
+
+networks:
+  splunk-network:
+    driver: bridge
+    attachable: true
+  traefik-network:
+    driver: bridge
+    attachable: true
+
+services:
+  # Traefik reverse proxy and load balancer
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      # Enable Docker provider
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik-network
+      # Configure entrypoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.mcp.address=:8000
+      # Enable API and dashboard (optional, for debugging)
+      - --api.dashboard=true
+      - --api.insecure=true
+      # Logging
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - "80:80"           # HTTP
+      - "8001:8000"       # MCP Server port
+      - "8080:8080"       # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik-network
+      - splunk-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.localhost`)"
+      - "traefik.http.routers.traefik.service=api@internal"
+
+  # MCP Server for Splunk
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    restart: unless-stopped
+    networks:
+      - traefik-network
+      - splunk-network
+    ports:
+      - "6274:6274"       # MCP Inspector direct access
+    environment:
+      - SPLUNK_HOST=${SPLUNK_HOST:-localhost}
+      - SPLUNK_PORT=${SPLUNK_PORT:-8089}
+      - SPLUNK_USERNAME=${SPLUNK_USERNAME:-admin}
+      - SPLUNK_PASSWORD=${SPLUNK_PASSWORD:-Chang3d!}
+      - SPLUNK_VERIFY_SSL=${SPLUNK_VERIFY_SSL:-false}
+    depends_on:
+      - so1
+      - traefik
+    labels:
+      # Enable Traefik for this service
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-network"
+      
+      # HTTP router for general access
+      - "traefik.http.routers.mcp-server.rule=Host(`mcp.localhost`)"
+      - "traefik.http.routers.mcp-server.entrypoints=web"
+      - "traefik.http.routers.mcp-server.service=mcp-server"
+      
+      # MCP-specific router for port 8001
+      - "traefik.http.routers.mcp-server-8001.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.mcp-server-8001.entrypoints=mcp"
+      - "traefik.http.routers.mcp-server-8001.service=mcp-server"
+      
+      # Service definition
+      - "traefik.http.services.mcp-server.loadbalancer.server.port=8000"
+      
+      # Health check (using root path since MCP server responds to all paths)
+      - "traefik.http.services.mcp-server.loadbalancer.healthcheck.path=/"
+      - "traefik.http.services.mcp-server.loadbalancer.healthcheck.interval=30s"
+      - "traefik.http.services.mcp-server.loadbalancer.healthcheck.timeout=10s"
+
+  # Splunk Enterprise (existing configuration)
+  so1:
+    networks:
+      splunk-network:
+        aliases:
+          - so1
+    image: ${SPLUNK_IMAGE:-splunk/splunk:latest}
+    platform: linux/amd64
+    hostname: so1
+    container_name: so1
+    restart: unless-stopped
+    environment:
+      - SPLUNK_START_ARGS=--accept-license
+      - SPLUNK_HEC_TOKEN=26898dec-83d1-49f1-b06e-90eabff7f543
+      - SPLUNK_PASSWORD=Chang3d!
+    ports:
+      - "9000:8000"   # Splunk Web UI
+      - "8088:8088"   # HEC
+      - "8089:8089"   # Management port
+    volumes:
+      - /Users/saikrishnagundeti/Development/OCD-NFR-Splunk.License-20250128-20260128.lic:/tmp/license/splunk.lic
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-k", "https://localhost:8089/services/server/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
