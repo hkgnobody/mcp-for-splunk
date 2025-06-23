@@ -1,0 +1,18 @@
+[project]
+name = "mcp-server-for-splunk"
+version = "0.1.0"
+description = "MCP server for Splunk"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.8.1",
+    "splunk-sdk>=1.7.0",
+    "python-dotenv>=1.0.0",
+    "fastmcp>=2.3.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0"
+]
