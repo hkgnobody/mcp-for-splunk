@@ -1,10 +1,5 @@
-version: "3.8"
-
 networks:
   splunk-network:
-    driver: bridge
-    attachable: true
-  traefik-network:
     driver: bridge
     attachable: true
 
@@ -18,7 +13,6 @@ services:
       # Enable Docker provider
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=traefik-network
       # Configure entrypoints
       - --entrypoints.web.address=:80
       - --entrypoints.mcp.address=:8000
@@ -35,7 +29,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - traefik-network
       - splunk-network
     labels:
       - "traefik.enable=true"
@@ -50,41 +43,53 @@ services:
     container_name: mcp-server
     restart: unless-stopped
     networks:
-      - traefik-network
       - splunk-network
     ports:
       - "6274:6274"       # MCP Inspector direct access
+      - "8002:8000"       # MCP Server direct access (optional)
     environment:
-      - SPLUNK_HOST=${SPLUNK_HOST:-localhost}
+      - SPLUNK_HOST=${SPLUNK_HOST:-so1}
       - SPLUNK_PORT=${SPLUNK_PORT:-8089}
       - SPLUNK_USERNAME=${SPLUNK_USERNAME:-admin}
       - SPLUNK_PASSWORD=${SPLUNK_PASSWORD:-Chang3d!}
       - SPLUNK_VERIFY_SSL=${SPLUNK_VERIFY_SSL:-false}
+      - MCP_SERVER_HOST=0.0.0.0
+      - MCP_SERVER_PORT=8000
     depends_on:
       - so1
       - traefik
     labels:
       # Enable Traefik for this service
       - "traefik.enable=true"
-      - "traefik.docker.network=traefik-network"
       
-      # HTTP router for general access
-      - "traefik.http.routers.mcp-server.rule=Host(`mcp.localhost`)"
-      - "traefik.http.routers.mcp-server.entrypoints=web"
-      - "traefik.http.routers.mcp-server.service=mcp-server"
+      # MCP-specific router for port 8001 (SSE transport)
+      - "traefik.http.routers.mcp-server-sse.rule=PathPrefix(`/sse`)"
+      - "traefik.http.routers.mcp-server-sse.entrypoints=mcp"
+      - "traefik.http.routers.mcp-server-sse.service=mcp-server-sse"
       
-      # MCP-specific router for port 8001
-      - "traefik.http.routers.mcp-server-8001.rule=PathPrefix(`/`)"
-      - "traefik.http.routers.mcp-server-8001.entrypoints=mcp"
-      - "traefik.http.routers.mcp-server-8001.service=mcp-server"
+      # Service definition pointing to container port 8000
+      - "traefik.http.services.mcp-server-sse.loadbalancer.server.port=8000"
       
-      # Service definition
-      - "traefik.http.services.mcp-server.loadbalancer.server.port=8000"
-      
-      # Health check (using root path since MCP server responds to all paths)
-      - "traefik.http.services.mcp-server.loadbalancer.healthcheck.path=/"
-      - "traefik.http.services.mcp-server.loadbalancer.healthcheck.interval=30s"
-      - "traefik.http.services.mcp-server.loadbalancer.healthcheck.timeout=10s"
+      # Add middleware for SSE and CORS headers
+      - "traefik.http.middlewares.mcp-headers.headers.customrequestheaders.Accept=application/json, text/event-stream"
+      - "traefik.http.middlewares.mcp-headers.headers.customresponseheaders.Access-Control-Allow-Origin=*"
+      - "traefik.http.middlewares.mcp-headers.headers.customresponseheaders.Access-Control-Allow-Methods=GET, POST, OPTIONS"
+      - "traefik.http.middlewares.mcp-headers.headers.customresponseheaders.Access-Control-Allow-Headers=Content-Type, Accept"
+      - "traefik.http.routers.mcp-server-sse.middlewares=mcp-headers"
+    develop:
+        watch:
+          - path: ./src
+            action: sync
+            target: /app/src
+            ignore:
+              - "**/__pycache__"
+              - "**/*.pyc"
+              - "**/*.pyo"
+              - "**/.pytest_cache"
+              - "**/venv"
+              - "**/.venv"
+          - path: ./pyproject.toml
+            action: rebuild
 
   # Splunk Enterprise (existing configuration)
   so1:
@@ -106,7 +111,7 @@ services:
       - "8088:8088"   # HEC
       - "8089:8089"   # Management port
     volumes:
-      - /Users/saikrishnagundeti/Development/OCD-NFR-Splunk.License-20250128-20260128.lic:/tmp/license/splunk.lic
+      - ./lic/splunk.lic:/tmp/license/splunk.lic
     healthcheck:
       test: ["CMD", "curl", "-s", "-k", "https://localhost:8089/services/server/info"]
       interval: 30s

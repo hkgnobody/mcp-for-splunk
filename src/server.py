@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 import asyncio
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 from splunklib import client
 from splunklib.results import ResultsReader
 import sys
@@ -47,37 +47,17 @@ async def splunk_lifespan(server: FastMCP) -> AsyncIterator[SplunkContext]:
     finally:
         logger.info("Closing Splunk connection")
 
-# Initialize FastMCP server
-mcp = FastMCP(
-    "MCP Server for Splunk",
-    description="MCP server for Splunk interaction",
-    version="0.1.0",
-    lifespan=splunk_lifespan,
-    prompt="""
-    You are a Splunk expert. You are able to answer questions about Splunk and Splunk apps.
-    You are able to use the following tools to get information about Splunk:
-    - get_splunk_health
-    - list_indexes
-    - list_sourcetypes
-    - list_sources
-    - run_oneshot_search
-    - run_splunk_search
-    - list_apps
-    - list_users
-    - list_kvstore_collections
-    - get_kvstore_data
-    - create_kvstore_collection
-    - list_kvstore_collections
-    - get_kvstore_data
-    - create_kvstore_collection
-    - list_kvstore_collections
-    """
-)
+# Initialize FastMCP server with lifespan context
+mcp = FastMCP(name="MCP Server for Splunk", lifespan=splunk_lifespan)
 
-# Health check will be handled by FastMCP's built-in health endpoint
+# Health check endpoint for Docker
+@mcp.resource("health://status")
+def health_check() -> str:
+    """Health check endpoint for Docker and load balancers"""
+    return "OK"
 
 @mcp.tool()
-def get_splunk_health(ctx: Context) -> Dict[str, Any]:
+def get_splunk_health() -> Dict[str, Any]:
     """
     Get Splunk connection health status
     
@@ -86,7 +66,7 @@ def get_splunk_health(ctx: Context) -> Dict[str, Any]:
     """
     logger.info("Checking Splunk health status...")
     try:
-        service = ctx.request_context.lifespan_context.service
+        service = get_splunk_service()
         info = {
             "status": "connected",
             "version": service.info["version"],
@@ -96,7 +76,10 @@ def get_splunk_health(ctx: Context) -> Dict[str, Any]:
         return info
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
-        raise
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 @mcp.tool()
 def list_indexes(ctx: Context) -> Dict[str, Any]:
@@ -655,19 +638,24 @@ def get_configurations(
         logger.error(f"Failed to get configurations: {str(e)}")
         raise
 
+async def main():
+    """Main function for running the MCP server"""
+    # Get the port from environment variable, default to 8000
+    port = int(os.environ.get("MCP_SERVER_PORT", 8000))
+    host = os.environ.get("MCP_SERVER_HOST", "0.0.0.0")
+    
+    logger.info(f"Starting MCP server on {host}:{port}")
+    
+    # Use FastMCP's built-in run_async method for proper lifespan management
+    await mcp.run_async(transport="http", host=host, port=port, path="/mcp/")
+
 if __name__ == "__main__":
-    import asyncio
     logger.info("Starting MCP Server for Splunk...")
+    import asyncio
     try:
-        # Using SSE transport for better compatibility with proxies and load balancers
-        asyncio.run(mcp.run())
-        # asyncio.run(mcp.run_async(
-        #     transport="sse",
-        #     host="0.0.0.0",
-        #     port=8000,
-        #     path="/mcp/sse",
-        #     message_path="/mcp/messages"
-        # ))
+        # Docker mode: use Streamable HTTP transport for web-based communication
+        logger.info("Running in Docker mode with Streamable HTTP transport")
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
     except Exception as e:
