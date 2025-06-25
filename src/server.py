@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 import asyncio
+import argparse
 from fastmcp import FastMCP, Context
 from splunklib import client
 from splunklib.results import ResultsReader
@@ -49,6 +50,10 @@ async def splunk_lifespan(server: FastMCP) -> AsyncIterator[SplunkContext]:
 
 # Initialize FastMCP server with lifespan context
 mcp = FastMCP(name="MCP Server for Splunk", lifespan=splunk_lifespan)
+
+mcp.dependencies = [
+    "splunk-mcp-server"
+]
 
 # Health check endpoint for Docker
 @mcp.resource("health://status")
@@ -558,7 +563,7 @@ def create_kvstore_collection(
             raise ValueError("App name is required")
             
         # Validate collection name
-        if not collection.isalnum() and not '_' in collection:
+        if not collection.isalnum() and '_' not in collection:
             raise ValueError("Collection name must contain only alphanumeric characters and underscores")
         
         # URL encode the app name to handle special characters
@@ -639,25 +644,85 @@ def get_configurations(
         raise
 
 async def main():
-    """Main function for running the MCP server"""
-    # Get the port from environment variable, default to 8000
-    port = int(os.environ.get("MCP_SERVER_PORT", 8000))
-    host = os.environ.get("MCP_SERVER_HOST", "0.0.0.0")
+    """Main function for running the MCP server with transport selection"""
+    parser = argparse.ArgumentParser(
+        description='MCP Server for Splunk',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run locally with stdio (default)
+  python src/server.py
+  python src/server.py --transport stdio
+
+  # Run with HTTP transport
+  python src/server.py --transport streamable-http
+  python src/server.py --transport streamable-http --host 0.0.0.0 --port 8000
+
+  # Environment variables (useful for Docker)
+  export MCP_TRANSPORT=streamable-http
+  export MCP_HOST=0.0.0.0
+  export MCP_PORT=8000
+  python src/server.py
+        """
+    )
     
-    logger.info(f"Starting MCP server on {host}:{port}")
+    parser.add_argument(
+        '--transport', 
+        choices=['stdio', 'streamable-http'], 
+        default=os.environ.get('MCP_TRANSPORT', 'stdio'),
+        help='Transport method: stdio (local) or streamable-http (remote)'
+    )
+    parser.add_argument(
+        '--host', 
+        default=os.environ.get('MCP_HOST', 'localhost'),
+        help='Host for HTTP transport (default: localhost)'
+    )
+    parser.add_argument(
+        '--port', 
+        type=int, 
+        default=int(os.environ.get('MCP_PORT', 8000)),
+        help='Port for HTTP transport (default: 8000)'
+    )
+    parser.add_argument(
+        '--path', 
+        default=os.environ.get('MCP_PATH', '/mcp/'),
+        help='Path for HTTP transport (default: /mcp/)'
+    )
     
-    # Use FastMCP's built-in run_async method for proper lifespan management
-    await mcp.run_async(transport="http", host=host, port=port, path="/mcp/")
+    # Parse arguments, but don't fail if none provided (for Docker compatibility)
+    if len(sys.argv) == 1:
+        # No arguments provided, use environment variables or defaults
+        args = argparse.Namespace(
+            transport=os.environ.get('MCP_TRANSPORT', 'stdio'),
+            host=os.environ.get('MCP_HOST', 'localhost'),
+            port=int(os.environ.get('MCP_PORT', 8000)),
+            path=os.environ.get('MCP_PATH', '/mcp/'),
+
+        )
+    else:
+        args = parser.parse_args()
+    
+    logger.info("🚀 Starting MCP Server for Splunk")
+    logger.info(f"📡 Transport: {args.transport}")
+    
+    if args.transport == "stdio":
+        logger.info("🔌 Running with STDIO transport (local mode)")
+        await mcp.run_async(transport="stdio")
+    elif args.transport == "streamable-http":
+        logger.info(f"🌐 Running with HTTP transport on {args.host}:{args.port}{args.path}")
+        await mcp.run_async(
+            transport="streamable-http", 
+            host=args.host, 
+            port=args.port, 
+            path=args.path
+        )
 
 if __name__ == "__main__":
     logger.info("Starting MCP Server for Splunk...")
-    import asyncio
     try:
-        # Docker mode: use Streamable HTTP transport for web-based communication
-        logger.info("Running in Docker mode with Streamable HTTP transport")
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Server stopped by user")
+        logger.info("👋 Server stopped by user")
     except Exception as e:
-        logger.error(f"Fatal server error: {str(e)}", exc_info=True)
+        logger.error(f"❌ Fatal server error: {str(e)}", exc_info=True)
         sys.exit(1)
