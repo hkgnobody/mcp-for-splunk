@@ -84,23 +84,37 @@ class BaseTool(ABC):
             if hasattr(ctx, "get_state"):
                 state_cfg = ctx.get_state("client_config")  # type: ignore[attr-defined]
                 if state_cfg:
-                    self.logger.info("Using client config from context state")
+                    self.logger.info(
+                        "Using client config from context state (keys=%s)", list(state_cfg.keys())
+                    )
                     return state_cfg
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug("Failed to get client config from context state: %s", e)
 
-        # Priority 2: HTTP request state (if HTTP transport)
+        # Priority 2: HTTP headers (using FastMCP runtime dependencies)
         try:
-            if hasattr(ctx.request_context, "request") and hasattr(
-                ctx.request_context.request, "state"
-            ):
-                if hasattr(ctx.request_context.request.state, "client_config"):
-                    client_config = ctx.request_context.request.state.client_config
-                    if client_config:
-                        self.logger.info("Using client config from HTTP headers")
-                        return client_config
-        except Exception:
-            pass
+            from fastmcp.server.dependencies import get_http_headers
+
+            headers = get_http_headers(include_all=True)
+            if headers:
+                self.logger.debug(
+                    "Attempting to extract config from HTTP headers (available: %s)",
+                    list(headers.keys()),
+                )
+
+                # Extract Splunk configuration from headers
+                from src.server import extract_client_config_from_headers
+
+                client_config = extract_client_config_from_headers(headers)
+
+                if client_config:
+                    self.logger.info(
+                        "Using client config from HTTP headers (keys=%s)",
+                        list(client_config.keys()),
+                    )
+                    return client_config
+        except Exception as e:
+            self.logger.debug("Failed to get client config from HTTP headers: %s", e)
 
         # Priority 3: Lifespan context (client environment)
         try:
@@ -108,9 +122,10 @@ class BaseTool(ABC):
             if hasattr(splunk_ctx, "client_config") and splunk_ctx.client_config:
                 self.logger.info("Using client config from environment variables")
                 return splunk_ctx.client_config
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug("Failed to get client config from lifespan context: %s", e)
 
+        self.logger.debug("No client config found in any source")
         return None
 
     async def get_splunk_service(
@@ -170,19 +185,25 @@ class BaseTool(ABC):
         Returns:
             Tuple of (is_available, service, error_message)
         """
-        splunk_ctx = ctx.request_context.lifespan_context
+        # Get splunk context from available sources
+        splunk_ctx = self._get_splunk_context(ctx)
 
         # First, prefer per-request client configuration (HTTP headers / client env)
         try:
             client_config = None
             # From HTTP request state (preferred for HTTP transport)
-            if hasattr(ctx.request_context, "request") and hasattr(
-                ctx.request_context.request, "state"
-            ) and hasattr(ctx.request_context.request.state, "client_config"):
+            if (
+                hasattr(ctx.request_context, "request")
+                and hasattr(ctx.request_context.request, "state")
+                and hasattr(ctx.request_context.request.state, "client_config")
+            ):
                 client_config = ctx.request_context.request.state.client_config
-            # Or from lifespan context (set by middleware/cache or client env)
-            elif hasattr(splunk_ctx, "client_config") and splunk_ctx.client_config:
-                client_config = splunk_ctx.client_config
+            # Or from context client_config (handle both dict and object)
+            elif splunk_ctx:
+                if hasattr(splunk_ctx, "client_config"):
+                    client_config = splunk_ctx.client_config
+                elif isinstance(splunk_ctx, dict) and "client_config" in splunk_ctx:
+                    client_config = splunk_ctx["client_config"]
 
             if client_config:
                 try:
@@ -200,14 +221,54 @@ class BaseTool(ABC):
             pass
 
         # Fallback: use server default service established at startup
-        if not splunk_ctx.is_connected or not splunk_ctx.service:
+        # Handle both SplunkContext objects and dict formats
+        is_connected = False
+        service = None
+
+        if splunk_ctx:
+            if hasattr(splunk_ctx, "is_connected") and hasattr(splunk_ctx, "service"):
+                # SplunkContext object
+                is_connected = splunk_ctx.is_connected
+                service = splunk_ctx.service
+            elif isinstance(splunk_ctx, dict):
+                # Dict format
+                is_connected = splunk_ctx.get("is_connected", False)
+                service = splunk_ctx.get("service", None)
+
+        if not is_connected or not service:
             return (
                 False,
                 None,
                 "Splunk service is not available. MCP server is running in degraded mode.",
             )
 
-        return True, splunk_ctx.service, ""
+        return True, service, ""
+
+    def _get_splunk_context(self, ctx: Context):
+        """
+        Get Splunk context from available sources with proper fallback handling.
+
+        Returns:
+            SplunkContext object, dict, or None
+        """
+        try:
+            # Try lifespan context first (traditional path)
+            if hasattr(ctx.request_context, "lifespan_context"):
+                return ctx.request_context.lifespan_context
+        except Exception:
+            pass
+
+        try:
+            # Fallback: try to get from server instance (module initialization path)
+            from fastmcp.server.dependencies import get_server
+
+            server = get_server()
+            if hasattr(server, "_splunk_context"):
+                return server._splunk_context
+        except Exception:
+            pass
+
+        return None
 
     def format_error_response(self, error: str, **kwargs) -> dict[str, Any]:
         """Format a consistent error response"""
