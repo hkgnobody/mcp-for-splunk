@@ -211,7 +211,160 @@ class MockSplunkService:
             mock_response.body.read.return_value = json.dumps({"success": True}).encode("utf-8")
             return mock_response
 
+        # Config create stanza: /servicesNS/{owner}/{app}/configs/conf-<conf>
+        if "/configs/conf-" in endpoint and not any(seg in endpoint for seg in ["/data/", "/acl"]):
+            # Determine if this is create or update based on presence of trailing stanza
+            base, conf_part = endpoint.split("/configs/conf-", 1)
+            if "/" not in conf_part:
+                # Create stanza
+                conf_name = conf_part
+                name = kwargs.get("name")
+                if not name:
+                    raise RuntimeError("Missing stanza name in create config POST")
+                # Ensure underlying dict exists
+                self._ensure_conf(conf_name)  # type: ignore[attr-defined]
+                conf_obj = self.confs[conf_name]
+                # Ensure _stanzas_dict exists and get reference to it
+                # Use try/except to reliably check attribute existence with Mock objects
+                try:
+                    stanzas_dict = conf_obj._stanzas_dict  # type: ignore[attr-defined]
+                    if not isinstance(stanzas_dict, dict):
+                        stanzas_dict = {}
+                        conf_obj._stanzas_dict = stanzas_dict  # type: ignore[attr-defined]
+                except AttributeError:
+                    stanzas_dict = {}
+                    conf_obj._stanzas_dict = stanzas_dict  # type: ignore[attr-defined]
+                # Build content from kwargs excluding 'name'
+                content = {k: v for k, v in kwargs.items() if k != "name"}
+                stanzas_dict[name] = content
+                # Build response payload
+                owner = base.split("/servicesNS/")[-1].split("/")[0] or "nobody"
+                app = (
+                    base.split("/servicesNS/")[-1].split("/")[1]
+                    if "/" in base.split("/servicesNS/")[-1]
+                    else "search"
+                )
+                entry = {
+                    "name": name,
+                    "content": content,
+                    "acl": {"app": app, "owner": owner},
+                }
+                mock_response.body.read.return_value = json.dumps({"entry": [entry]}).encode(
+                    "utf-8"
+                )
+                return mock_response
+            else:
+                # Update existing stanza: /configs/conf-<conf>/<stanza>
+                conf_name, stanza_name = conf_part.split("/", 1)
+                self._ensure_conf(conf_name)  # type: ignore[attr-defined]
+                conf_obj = self.confs[conf_name]
+                # Ensure _stanzas_dict exists and get reference to it
+                # Use getattr with sentinel to avoid hasattr issues with Mock objects
+                if getattr(conf_obj, "_stanzas_dict", None) is None:
+                    conf_obj._stanzas_dict = {}  # type: ignore[attr-defined]
+                stanzas_dict = conf_obj._stanzas_dict  # type: ignore[attr-defined]
+                current = stanzas_dict.get(stanza_name, {})
+                # Merge provided keys into existing
+                for k, v in kwargs.items():
+                    current[k] = v
+                stanzas_dict[stanza_name] = current
+                owner = base.split("/servicesNS/")[-1].split("/")[0] or "nobody"
+                app = (
+                    base.split("/servicesNS/")[-1].split("/")[1]
+                    if "/" in base.split("/servicesNS/")[-1]
+                    else "search"
+                )
+                entry = {
+                    "name": stanza_name,
+                    "content": current,
+                    "acl": {"app": app, "owner": owner},
+                }
+                mock_response.body.read.return_value = json.dumps({"entry": [entry]}).encode(
+                    "utf-8"
+                )
+                return mock_response
+
         # Default empty response
+        mock_response.body.read.return_value = json.dumps({}).encode("utf-8")
+        return mock_response
+
+    def get(self, endpoint: str, **kwargs):
+        """Mock GET handler for Splunk REST endpoints used by admin/config tools."""
+        mock_response = Mock()
+        owner = kwargs.get("owner") or "nobody"
+        app = kwargs.get("app") or "search"
+        output_mode = kwargs.get("output_mode", "json")
+
+        # Config specific stanza: /services/configs/conf-<conf>/<stanza>
+        # Check this BEFORE the listing pattern to avoid matching listing endpoints
+        if (
+            endpoint.startswith("/services/configs/conf-")
+            and "/" in endpoint[len("/services/configs/conf-") :]
+        ):
+            parts = endpoint.split("/services/configs/conf-")[-1].split("/")
+            conf_name = parts[0]
+            stanza_name = parts[1]
+            entries = []
+            conf_obj = self.confs.get(conf_name)
+            if conf_obj:
+                stanzas_dict = getattr(conf_obj, "_stanzas_dict", None)
+                if isinstance(stanzas_dict, dict):
+                    # Only return entry if stanza actually exists in dict
+                    if stanza_name in stanzas_dict:
+                        content = stanzas_dict[stanza_name]
+                        entries.append(
+                            {
+                                "name": stanza_name,
+                                "content": content,
+                                "acl": {"app": app, "owner": owner},
+                            }
+                        )
+                else:
+                    # Fallback to iterator-based access
+                    content = (
+                        conf_obj.__getitem__(stanza_name).content
+                        if hasattr(conf_obj, "__getitem__")
+                        else {}
+                    )
+                    if content is not None:
+                        entries.append(
+                            {
+                                "name": stanza_name,
+                                "content": content,
+                                "acl": {"app": app, "owner": owner},
+                            }
+                        )
+            payload = {"entry": entries}
+            mock_response.body.read.return_value = json.dumps(payload).encode("utf-8")
+            return mock_response
+
+        # Config listing: /services/configs/conf-<conf>
+        if endpoint.startswith("/services/configs/conf-") and output_mode == "json":
+            conf_name = endpoint.split("/services/configs/conf-")[-1].split("/")[0]
+            entries = []
+            conf_obj = self.confs.get(conf_name)
+            if conf_obj:
+                # Prefer dynamic dict if available
+                stanzas_dict = getattr(conf_obj, "_stanzas_dict", None)
+                if isinstance(stanzas_dict, dict):
+                    for name, content in stanzas_dict.items():
+                        entries.append(
+                            {"name": name, "content": content, "acl": {"app": app, "owner": owner}}
+                        )
+                else:
+                    for stanza in conf_obj:
+                        entries.append(
+                            {
+                                "name": stanza.name,
+                                "content": stanza.content,
+                                "acl": {"app": app, "owner": owner},
+                            }
+                        )
+            payload = {"entry": entries}
+            mock_response.body.read.return_value = json.dumps(payload).encode("utf-8")
+            return mock_response
+
+        # Default empty JSON
         mock_response.body.read.return_value = json.dumps({}).encode("utf-8")
         return mock_response
 
@@ -265,7 +418,10 @@ class MockSplunkService:
             mock_conf = Mock()
             mock_conf.name = conf_name
 
-            # Create mock stanza objects
+            # Store stanzas dict for direct access (avoids recursion issues)
+            mock_conf._stanzas_dict = stanzas.copy()  # type: ignore[attr-defined]
+
+            # Create mock stanza objects for iteration
             mock_stanzas = []
             for stanza_name, content in stanzas.items():
                 mock_stanza = Mock()
@@ -274,7 +430,13 @@ class MockSplunkService:
                 mock_stanzas.append(mock_stanza)
 
             # Make the conf object iterable to return stanzas
-            mock_conf.__iter__ = lambda stanzas=mock_stanzas: iter(stanzas)
+            # Generate iterator from _stanzas_dict on-demand to avoid sync issues
+            def make_iter():
+                # Generate mock stanza objects from dict to avoid recursion
+                stanzas_dict = getattr(mock_conf, "_stanzas_dict", {})
+                return iter([Mock(name=n, content=c) for n, c in stanzas_dict.items()])
+
+            mock_conf.__iter__ = make_iter
 
             # Allow accessing specific stanzas by name
             mock_conf.__getitem__ = lambda key, stanzas_dict=stanzas: Mock(
@@ -282,6 +444,41 @@ class MockSplunkService:
             )
 
             self.confs[conf_name] = mock_conf
+
+        # Support updates/creates via REST endpoints by mutating self.confs
+        def _ensure_conf(conf_name: str):
+            if conf_name not in self.confs:
+                mock_conf = Mock()
+                mock_conf.name = conf_name
+                stanzas = {}
+                mock_conf._stanzas_dict = stanzas  # type: ignore[attr-defined]
+
+                # Create iterator function that generates from dict on-demand
+                def make_iter():
+                    stanzas_dict = getattr(mock_conf, "_stanzas_dict", {})
+                    return iter([Mock(name=n, content=c) for n, c in stanzas_dict.items()])
+
+                mock_conf.__iter__ = make_iter
+                mock_conf.__getitem__ = lambda key, stanzas_dict=stanzas: Mock(
+                    name=key, content=stanzas_dict.get(key, {})
+                )
+                self.confs[conf_name] = mock_conf
+            else:
+                # Config exists - ensure _stanzas_dict exists but preserve existing data
+                conf_obj = self.confs[conf_name]
+                # Only create empty dict if it truly doesn't exist (not just None)
+                # Use try/except to reliably check attribute existence with Mock objects
+                try:
+                    existing_dict = conf_obj._stanzas_dict  # type: ignore[attr-defined]
+                    if not isinstance(existing_dict, dict):
+                        # If it exists but isn't a dict, replace it
+                        conf_obj._stanzas_dict = {}  # type: ignore[attr-defined]
+                except AttributeError:
+                    # Attribute doesn't exist, create it
+                    conf_obj._stanzas_dict = {}  # type: ignore[attr-defined]
+
+        # Monkey-patch helpers on instance for POST handlers to use
+        self._ensure_conf = _ensure_conf  # type: ignore[attr-defined]
 
 
 class MockJob:
