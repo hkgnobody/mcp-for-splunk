@@ -65,6 +65,20 @@ _UVICORN_LEVEL_MAP = {
 UVICORN_LOG_LEVEL = _UVICORN_LEVEL_MAP.get(LOG_LEVEL, "info")
 logger = logging.getLogger(__name__)
 
+# Suppress noisy Pydantic JSON schema warnings for non-serializable defaults
+try:
+    import warnings as _warnings
+
+    from pydantic.json_schema import PydanticJsonSchemaWarning
+
+    _warnings.filterwarnings(
+        "ignore",
+        category=PydanticJsonSchemaWarning,
+        message="Default value .* is not JSON serializable; excluding default from JSON schema",
+    )
+except Exception:
+    pass
+
 # Global cache to persist client config per session across Streamable HTTP requests
 # Keyed by a caller-provided "X-Session-ID" header value
 HEADER_CLIENT_CONFIG_CACHE: dict[str, dict] = {}
@@ -427,7 +441,115 @@ async def ensure_components_loaded(server: FastMCP) -> None:
 
 # Initialize FastMCP server without lifespan (components loaded at startup instead)
 # Note: lifespan causes issues in HTTP mode as it runs for each SSE connection
-mcp = FastMCP(name="MCP Server for Splunk")
+# Optionally load auth verifier dynamically (module:attr) or via Supabase API fallback
+auth_verifier = None
+# Disable entirely
+if (os.getenv("MCP_AUTH_DISABLED") or "false").strip().lower() == "true":
+    logger.info("Auth disabled via MCP_AUTH_DISABLED=true")
+else:
+    # Highest priority: dynamic provider path from env
+    provider_spec = (os.getenv("MCP_AUTH_PROVIDER") or "").strip()
+    if provider_spec:
+        try:
+            import importlib
+            import inspect
+            import json
+
+            module_name, attr_name = None, None
+            if ":" in provider_spec:
+                module_name, attr_name = provider_spec.split(":", 1)
+            else:
+                parts = provider_spec.rsplit(".", 1)
+                if len(parts) == 2:
+                    module_name, attr_name = parts[0], parts[1]
+            if module_name and attr_name:
+                mod = importlib.import_module(module_name)
+                target = getattr(mod, attr_name)
+                kwargs_str = (os.getenv("MCP_AUTH_PROVIDER_KWARGS") or "").strip()
+                kwargs = {}
+                if kwargs_str:
+                    try:
+                        kwargs = json.loads(kwargs_str)
+                    except json.JSONDecodeError as _json_err:
+                        logger.error(
+                            "Invalid MCP_AUTH_PROVIDER_KWARGS JSON (length=%s): %s",
+                            len(kwargs_str),
+                            _json_err,
+                        )
+                        raise SystemExit(
+                            "Invalid MCP_AUTH_PROVIDER_KWARGS JSON. Fix the JSON or unset MCP_AUTH_PROVIDER_KWARGS."
+                        ) from _json_err
+                if callable(target):
+                    try:
+                        sig = inspect.signature(target)
+                        params = sig.parameters
+                        required = [
+                            p
+                            for p in params.values()
+                            if p.default is inspect._empty
+                            and p.kind
+                            in (
+                                inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                inspect.Parameter.KEYWORD_ONLY,
+                            )
+                        ]
+                        accepts_var_kw = any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+                        )
+                        if kwargs:
+                            if accepts_var_kw:
+                                call_kwargs = kwargs
+                            else:
+                                call_kwargs = {k: v for k, v in kwargs.items() if k in params}
+                            auth_verifier = target(**call_kwargs)
+                        else:
+                            if required:
+                                logger.warning(
+                                    "Dynamic auth provider '%s' requires arguments but none provided; set MCP_AUTH_PROVIDER_KWARGS",
+                                    provider_spec,
+                                )
+                                auth_verifier = None
+                            else:
+                                auth_verifier = target()
+                    except (ValueError, TypeError) as _sig_err:
+                        logger.warning(
+                            "Dynamic auth provider '%s' signature inspection/call issue: %s",
+                            provider_spec,
+                            _sig_err,
+                        )
+                        try:
+                            auth_verifier = target()
+                        except Exception as fallback_err:
+                            logger.debug(
+                                "Dynamic auth provider '%s' fallback bare call failed: %s",
+                                provider_spec,
+                                fallback_err,
+                            )
+                            auth_verifier = None
+                else:
+                    auth_verifier = target
+                if auth_verifier:
+                    logger.info("Using dynamic auth provider: %s", provider_spec)
+            else:
+                logger.error("Invalid MCP_AUTH_PROVIDER format: %s", provider_spec)
+                raise SystemExit(
+                    "MCP_AUTH_PROVIDER is set but invalid. Set MCP_AUTH_DISABLED=true to bypass."
+                )
+        except Exception as _e:
+            logger.error("Failed to import dynamic auth provider '%s': %s", provider_spec, _e)
+            raise SystemExit(
+                "MCP_AUTH_PROVIDER is set but failed to load. Set MCP_AUTH_DISABLED=true to bypass."
+            ) from _e
+
+        # If a provider was specified but did not yield a verifier, fail fast for security
+        if auth_verifier is None:
+            logger.error("MCP_AUTH_PROVIDER is set but no auth provider instance was created.")
+            raise SystemExit(
+                "Auth provider missing. Set MCP_AUTH_DISABLED=true to explicitly disable auth."
+            )
+
+mcp = FastMCP(name="MCP Server for Splunk", auth=auth_verifier)
 
 # Import and setup health routes
 setup_health_routes(mcp)
